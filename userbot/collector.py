@@ -1,40 +1,33 @@
-"""GiftHawk collector v5 — روی GitHub Actions به‌صورت «پیوسته» (حدود ۵۴ دقیقه در هر اجرا) کار می‌کند.
-
-⚠️ تست‌نشده با تلگرام واقعی. فرض‌ها (اگر خطا داد، متن لاگ را ببین و همین فایل را اصلاح کن):
-  • نسخهٔ telethon باید متدهای GetStarGiftsRequest و GetResaleStarGiftsRequest را داشته باشد.
-  • نام فیلدهای StarGift/StarGiftUnique (resell_amount، rarity یا rarity_permille، attributes، availability_resale)
-    بین لایه‌ها فرق کرده؛ کد عمداً با getattr دفاعی نوشته شده و آنچه نفهمد را رد می‌کند.
-  • مینی‌اپ Portals (short name = market) و Tonnel برای گرفتن initData حدسی‌اند و با env قابل تغییرند.
+"""GiftHawk collector — نسخهٔ نهایی (v5.2). روی GitHub Actions پیوسته (~۵۴ دقیقه در هر اجرا) کار می‌کند.
 
 کارها (حساب userbot باید در بات «ادمین» باشد):
-  ۱) هر ~۳۰ دقیقه: فهرست «کامل» کالکشن‌های گیفت تلگرام → /cols   (دیگر هیچ کالکشنی دستی اضافه نمی‌شود)
-  ۲) پیوسته (هر چرخه ~۴۵–۶۰ ثانیه): ارزان‌ترین آگهی‌های ریسِیل هر کالکشنِ دارای آگهی → /ingest
-     فقط اگر چیزی تغییر کرده باشد (یا هر ~۸ دقیقه برای تازه‌ماندن)؛ بات همان لحظه ارزیابی و ارسال می‌کند.
-  ۳) آهسته و چرخشی: مدل/پس‌زمینه/نمادهای هر کالکشن → /cat (برای دکمه‌های انتخاب در بات)
-  ۴) هر ۵ دقیقه نرخ‌ها (/rate) و هر ~۳۰ دقیقه initData تازهٔ Portals/Tonnel (/setsecret)
+  ۱) فهرست کالکشن‌های گیفت تلگرام → /cols      ۲) ارزان‌ترین آگهی‌های ریسِیل هر کالکشن → /ingest (فقط وقت تغییر)
+  ۳) مدل/پس‌زمینه/نمادها → /cat                ۴) نرخ‌ها → /rate  و توکن Portals/Tonnel → /setsecret
+
+سه لایهٔ پیدا کردن نام کالکشن‌ها (اگر یکی کار نکرد بعدی):
+  الف) payments.getStarGifts و فیلد title    ب) نام از اولین آگهی ریسِیل همان گیفت    ج) فهرست داخلی + payments.getUniqueStarGift
+هر جا چیزی نخواند، دلیلش (نام کلاس‌ها و فیلدها) در لاگ چاپ می‌شود؛ هیچ‌چیز محرمانه‌ای چاپ نمی‌شود.
 """
-import asyncio, json, os, statistics, time
+import asyncio, json, os, statistics, sys, time
 import urllib.request
 from urllib.parse import urlparse, parse_qs
 
 from telethon import TelegramClient, functions, types, errors
 from telethon.sessions import StringSession
 
-API_ID = int(os.environ['TG_API_ID'])
-API_HASH = os.environ['TG_API_HASH']
-SESSION = os.environ['TG_SESSION']
-BOT = os.environ['BOT_USERNAME'].lstrip('@')
-RUN_MINUTES = float(os.environ.get('RUN_MINUTES', '54'))          # مدت زندگی هر اجرا؛ اجرای بعدی با cron + صف concurrency ادامه می‌دهد
-PER_COL = int(os.environ.get('PER_COL', '40'))                    # چند آگهی ارزان از هر کالکشن
-RPS = float(os.environ.get('RPS', '2.5'))                         # سقف درخواست به تلگرام در ثانیه (محتاطانه؛ FloodWait خودکار مدیریت می‌شود)
-MIN_CYCLE_S = float(os.environ.get('MIN_CYCLE_S', '45'))
-RESEND_S = int(os.environ.get('RESEND_S', '480'))                 # حتی بدون تغییر، هر چند ثانیه یک‌بار دوباره بفرست (بات داده‌ی کهنه‌تر از ۴۰ دقیقه را نادیده می‌گیرد)
-CAT_PER_CYCLE = int(os.environ.get('CAT_PER_CYCLE', '3'))
-CAT_EVERY_S = int(os.environ.get('CAT_EVERY_S', str(6 * 3600)))
-FORCE_TOKENS = os.environ.get('REFRESH_TOKENS', '') == '1'
-PORTALS_BOT, PORTALS_APP = os.environ.get('PORTALS_BOT', 'portals'), os.environ.get('PORTALS_APP', 'market')
-TONNEL_BOT, TONNEL_URL = os.environ.get('TONNEL_BOT', 'tonnel_network_bot'), os.environ.get('TONNEL_URL', 'https://market.tonnel.network/')
-MSG_LIMIT = 3800                                                 # حد پیام تلگرام ۴۰۹۶ کاراکتر است
+E = os.environ.get
+API_ID, API_HASH, SESSION, BOT = int(E('TG_API_ID') or 0), E('TG_API_HASH', ''), E('TG_SESSION', ''), (E('BOT_USERNAME') or '').lstrip('@')
+RUN_MINUTES = float(E('RUN_MINUTES', '54'))
+PER_COL = int(E('PER_COL', '40'))
+RPS = float(E('RPS', '2.5'))
+MIN_CYCLE_S = float(E('MIN_CYCLE_S', '45'))
+RESEND_S = int(E('RESEND_S', '480'))
+CAT_PER_CYCLE = int(E('CAT_PER_CYCLE', '3'))
+CAT_EVERY_S = int(E('CAT_EVERY_S', str(6 * 3600)))
+PORTALS_BOT, PORTALS_APP = E('PORTALS_BOT', 'portals'), E('PORTALS_APP', 'market')
+TONNEL_BOT, TONNEL_URL = E('TONNEL_BOT', 'tonnel_network_bot'), E('TONNEL_URL', 'https://market.tonnel.network/')
+MSG_LIMIT = 3800
+SEED = ['Plush Pepe', 'Heart Locket', "Durov's Cap", 'Precious Peach', 'Heroic Helmet', 'Nail Bracelet', 'Astral Shard', 'Mighty Arm', 'Perfume Bottle', 'Bonded Ring', 'Scared Cat', 'Loot Bag', 'Vintage Cigar', 'Genie Lamp', 'Swiss Watch', 'Neko Helmet', 'Eternal Rose', 'Electric Skull', 'Diamond Ring', 'Mini Oscar', 'Gem Signet', 'Toy Bear', 'Santa Hat', 'Signet Ring', 'Top Hat', 'Love Potion', 'Magic Potion', 'Kissed Frog', 'Voodoo Doll', 'Trapped Heart', 'Sharp Tongue', 'Skull Flower', 'Cookie Heart', 'Jester Hat', 'Witch Hat', 'Hex Pot', 'Evil Eye', 'Homemade Cake', 'Sleigh Bell', 'Ginger Cookie', 'Snow Globe', 'Spiced Wine', 'Jingle Bells', 'Snow Mittens', 'Winter Wreath', 'Light Sword', 'Berry Box', 'Bunny Muffin', 'Desk Calendar', 'B-Day Candle', 'Lol Pop', 'Jelly Bunny', 'Hypno Lollipop', 'Candy Cane', 'Big Year', 'Party Sparkler', 'Pet Snake', 'Snake Box', 'Lunar Snake', 'Record Player', 'Spy Agaric', 'Star Notepad', 'Easter Egg', 'Tama Gadget', 'Ion Gem', 'Swag Bag', 'Flying Broom', 'Crystal Ball', 'Bow Tie', 'Restless Jar', 'Joyful Bundle', 'Whip Cupcake', 'Instant Ramen', 'Faith Amulet', 'Mad Pumpkin', 'Input Key', 'Cupid Charm', 'Valentine Box', 'Holiday Drink', 'Xmas Stocking', 'Pool Float', 'Moon Pendant', 'Lush Bouquet', 'Sakura Flower', 'Ice Cream', 'Westside Sign', 'Low Rider', 'Snoop Dogg', 'Snoop Cigar', "Khabib's Papakha", 'UFC Strike', 'Victory Medal', 'Chill Flame', 'Stellar Rocket', 'Siren Chime', 'Jack-in-the-Box', 'Ionic Dryer', 'Gift Box']
 
 t0 = time.time()
 log = lambda *a: print(f'[collector {time.time() - t0:6.0f}s]', *a, flush=True)
@@ -63,7 +56,7 @@ _last_send = [0.0]
 
 
 async def to_bot(c, text):
-    """پیام به بات؛ parse_mode=None تا مارک‌داون تلگرام (_ و * و `) JSON و توکن‌ها را خراب نکند."""
+    """پیام به بات؛ parse_mode=None تا مارک‌داون JSON و توکن‌ها را خراب نکند."""
     for _ in range(3):
         wait = 0.4 - (time.time() - _last_send[0])
         if wait > 0: await asyncio.sleep(wait)
@@ -76,16 +69,31 @@ async def to_bot(c, text):
     raise RuntimeError('FloodWait مکرر در ارسال')
 
 
-# ───────────────────────── ابزار استخراج از آبجکت‌های تلگرام ─────────────────────────
+_warned = set()
+def warn_once(key, *msg):
+    if key not in _warned: _warned.add(key); log('⚠️', *msg)
+
+
+def keys_of(o):
+    try: return ','.join(sorted(o.to_dict().keys()))[:400]
+    except Exception: return ','.join(a for a in dir(o) if not a.startswith('_'))[:400]
+
+
+# ───────────────────────── استخراج از آبجکت‌های تلگرام (دفاعی، چند نام فیلد) ─────────────────────────
 def stars_price(g):
-    for a in (getattr(g, 'resell_amount', None) or []):
-        if a.__class__.__name__ == 'StarsAmount': return int(a.amount)
-    v = getattr(g, 'resell_stars', None)
-    return int(v) if v else None
+    ra = getattr(g, 'resell_amount', None)
+    for a in (ra if isinstance(ra, (list, tuple)) else [ra]):
+        if a is not None and a.__class__.__name__ == 'StarsAmount':
+            try: return int(a.amount)
+            except Exception: pass
+    for k in ('resell_stars', 'resale_stars'):
+        v = getattr(g, k, None)
+        if isinstance(v, int) and v > 0: return v
+    return None
 
 
 def permille(a):
-    """کمیابی به هزارم: هم لایهٔ قدیمی (rarity_permille) هم جدید (rarity.permille)؛ ردهٔ نامی بدون عدد → -1."""
+    """کمیابی به هزارم: rarity_permille (قدیم)، rarity.permille (جدید)؛ ردهٔ نامی بدون عدد → -1."""
     v = getattr(a, 'rarity_permille', None)
     if isinstance(v, int): return v
     p = getattr(getattr(a, 'rarity', None), 'permille', None)
@@ -112,12 +120,6 @@ def row(g, listed_at):
     return [num, p, a['m'][0], a['m'][1], a['b'][0], a['b'][1], a['s'][0], a['s'][1], listed_at]
 
 
-# ───────────────────────── کاتالوگ کالکشن‌ها ─────────────────────────
-async def all_gifts(c):
-    r = await pacer.call(c, functions.payments.GetStarGiftsRequest(hash=0))
-    return [g for g in (getattr(r, 'gifts', None) or []) if getattr(g, 'title', None)]
-
-
 def pack(items, make):
     """آیتم‌ها را در چند پیام ≤ MSG_LIMIT بسته‌بندی می‌کند؛ make(لیست، شمارهٔ بخش، آخرین؟) → متن."""
     parts, cur = [], []
@@ -129,37 +131,94 @@ def pack(items, make):
     return [make(p, i, i == len(parts) - 1) for i, p in enumerate(parts)]
 
 
+# ───────────────────────── فراخوانی‌های تلگرام ─────────────────────────
+async def resale(c, gift_id, **kw):
+    req = dict(gift_id=gift_id, offset='', **kw)
+    try: r = functions.payments.GetResaleStarGiftsRequest(stars_only=True, **req)
+    except TypeError: r = functions.payments.GetResaleStarGiftsRequest(**req)      # لایهٔ قدیمی‌تر stars_only ندارد
+    return await pacer.call(c, r)
+
+
+_names: dict = {}      # gift_id → نام کالکشن
+_diag_done = set()
+
+
+async def name_from_resale(c, gid):
+    res = await resale(c, gid, limit=1)
+    for u in (getattr(res, 'gifts', None) or []):
+        n = getattr(u, 'title', None)
+        if n: return n
+    return None
+
+
+async def name_from_seed(c, gid_names, seed_name):
+    """لایهٔ ج: با slug تلگرام (مثل PlushPepe-1) شناسهٔ گیفت پایه را می‌گیریم."""
+    base = ''.join(ch for ch in seed_name if ch.isalnum())
+    for n in (1, 2, 3, 5, 10):
+        try:
+            r = await pacer.call(c, functions.payments.GetUniqueStarGiftRequest(slug=f'{base}-{n}'))
+            gift = getattr(r, 'gift', r)
+            gid = getattr(gift, 'gift_id', None)
+            if gid: return gid, getattr(gift, 'title', None) or seed_name
+        except errors.FloodWaitError: raise
+        except Exception: continue
+    return None
+
+
+async def all_gifts(c):
+    """خروجی: [(gift_or_id_holder, name)] برای همهٔ کالکشن‌هایی که پیدا شد."""
+    out, seen_ids = [], set()
+    try:
+        r = await pacer.call(c, functions.payments.GetStarGiftsRequest(hash=0))
+        gifts = list(getattr(r, 'gifts', None) or [])
+        log(f'GetStarGifts → {type(r).__name__}، تعداد={len(gifts)}' + (f'، نمونه={gifts[0].__class__.__name__} فیلدها={keys_of(gifts[0])}' if gifts else ''))
+        for g in gifts:
+            name = getattr(g, 'title', None) or _names.get(g.id)
+            if not name and getattr(g, 'availability_resale', 1) != 0:     # لایهٔ ب: نام از آگهی ریسِیل
+                try: name = await name_from_resale(c, g.id)
+                except errors.FloodWaitError: raise
+                except Exception as e: log('name probe FAIL', g.id, repr(e)[:100])
+            if name: _names[g.id] = name; out.append((g, name)); seen_ids.add(g.id)
+        log(f'لایهٔ الف/ب: {len(out)} کالکشن با نام از {len(gifts)} گیفت')
+    except Exception as e: log('GetStarGifts FAIL:', repr(e)[:200])
+    if len(out) < 5:                                                       # لایهٔ ج: فهرست داخلی + getUniqueStarGift
+        log('لایهٔ ج: پیدا کردن شناسه‌ها از روی فهرست داخلی و slug …')
+        have = {n.lower() for _, n in out}
+        class Holder:                                                      # مثل gift، فقط id و availability نامعلوم
+            def __init__(self, i): self.id = i
+        for sn in SEED:
+            if left() < 60: break
+            if sn.lower() in have: continue
+            try: hit = await name_from_seed(c, None, sn)
+            except Exception as e: log('seed FAIL', sn, repr(e)[:80]); continue
+            if hit and hit[0] not in seen_ids:
+                _names[hit[0]] = hit[1]; seen_ids.add(hit[0]); out.append((Holder(hit[0]), hit[1]))
+        log(f'لایهٔ ج: مجموعاً {len(out)} کالکشن')
+    return out
+
+
 async def send_cols(c, gifts):
-    items = [[g.title, int(getattr(g, 'availability_resale', 0) or 0)] for g in gifts]
+    items = [[name, int(getattr(g, 'availability_resale', 0) or 0)] for g, name in gifts]
     for msg in pack(items, lambda l, i, last: '/cols ' + json.dumps({'l': l}, ensure_ascii=False, separators=(',', ':'))):
         await to_bot(c, msg)
     log(f'کاتالوگ: {len(items)} کالکشن به بات فرستاده شد')
 
 
-async def resale(c, gift_id, **kw):
-    req = dict(gift_id=gift_id, offset='', **kw)
-    try: return await pacer.call(c, functions.payments.GetResaleStarGiftsRequest(stars_only=True, **req))
-    except TypeError: return await pacer.call(c, functions.payments.GetResaleStarGiftsRequest(**req))   # لایهٔ قدیمی‌تر stars_only ندارد
-
-
-async def send_catalog(c, g):
-    """مدل/پس‌زمینه/نمادهای یک کالکشن (برای دکمه‌های انتخاب در بات)."""
+async def send_catalog(c, g, name):
     res = await resale(c, g.id, limit=1, attributes_hash=0)
     by = {'m': [], 'b': [], 's': []}
     for a in (getattr(res, 'attributes', None) or []):
-        k = attr_kind(a)
-        name = getattr(a, 'name', None)
-        if k and name: by[k].append([name, permille(a)])
-    n = 0
+        k, n = attr_kind(a), getattr(a, 'name', None)
+        if k and n: by[k].append([n, permille(a)])
+    total = 0
     for k, items in by.items():
         if not items: continue
-        for msg in pack(items, lambda l, i, last, k=k: '/cat ' + json.dumps({'c': g.title, 'k': k, 'p': i, 'l': l}, ensure_ascii=False, separators=(',', ':'))):
+        for msg in pack(items, lambda l, i, last, k=k: '/cat ' + json.dumps({'c': name, 'k': k, 'p': i, 'l': l}, ensure_ascii=False, separators=(',', ':'))):
             await to_bot(c, msg)
-        n += len(items)
-    return n
+        total += len(items)
+    return total
 
 
-# ───────────────────────── آگهی‌ها ─────────────────────────
 class Snap:
     def __init__(self): self.sig, self.sent_at, self.first = None, 0.0, {}
 
@@ -176,31 +235,34 @@ def ingest_msgs(col, rows):
     return pack(rows, make)
 
 
-async def poll_collection(c, g):
+async def poll_collection(c, g, name):
     res = await resale(c, g.id, limit=PER_COL, sort_by_price=True)
-    s = snaps.setdefault(g.title, Snap())
+    got = list(getattr(res, 'gifts', None) or [])
+    if got and 'sample' not in _diag_done:
+        _diag_done.add('sample'); log(f'نمونهٔ آگهی {name}: {got[0].__class__.__name__} فیلدها={keys_of(got[0])}')
+    s = snaps.setdefault(name, Snap())
     now_ms, rows = int(time.time() * 1000), []
     first_poll = s.sig is None
-    for u in (getattr(res, 'gifts', None) or []):
+    for u in got:
         p, num = stars_price(u), getattr(u, 'num', None)
         if not p or not isinstance(num, int): continue
         prev = s.first.get(num)
-        if prev is None or p < prev[0]:                           # آگهی تازه یا کاهش قیمت = «تازه آگهی شد»
-            s.first[num] = (p, 0 if first_poll else now_ms)
+        if prev is None or p < prev[0]: s.first[num] = (p, 0 if first_poll else now_ms)   # آگهی تازه یا کاهش قیمت
         r = row(u, s.first[num][1])
         if r: rows.append(r)
+    if got and not rows:
+        warn_once('noprice', f'{name}: آگهی هست ولی قیمت استارز استخراج نشد (احتمالاً فقط TON). resell_amount={getattr(got[0], "resell_amount", None)!r:.200}')
     sig = tuple(sorted((r[0], r[1]) for r in rows))
     changed = sig != s.sig
     if not changed and time.time() - s.sent_at < RESEND_S: return 0
-    for msg in ingest_msgs(g.title, rows): await to_bot(c, msg)
+    for msg in ingest_msgs(name, rows): await to_bot(c, msg)
     s.sig, s.sent_at = sig, time.time()
     return 1 if changed else 0
 
 
-# ───────────────────────── نرخ‌ها و توکن‌ها (مثل نسخهٔ قبل) ─────────────────────────
+# ───────────────────────── نرخ‌ها و توکن‌ها ─────────────────────────
 def init_data(url: str) -> str:
-    frag = parse_qs(urlparse(url).fragment)
-    return (frag.get('tgWebAppData') or [''])[0]
+    return (parse_qs(urlparse(url).fragment).get('tgWebAppData') or [''])[0]
 
 
 async def refresh_tokens(c):
@@ -220,13 +282,11 @@ async def refresh_tokens(c):
     except Exception as e: log('tonnel token FAIL:', repr(e)[:200])
 
 
-TON_SOURCES = [
-    ('okx', 'https://www.okx.com/api/v5/market/ticker?instId=TON-USDT', lambda j: j['data'][0]['last']),
-    ('kucoin', 'https://api.kucoin.com/api/v1/market/orderbook/level1?symbol=TON-USDT', lambda j: j['data']['price']),
-    ('gate', 'https://api.gateio.ws/api/v4/spot/tickers?currency_pair=TON_USDT', lambda j: j[0]['last']),
-    ('bybit', 'https://api.bybit.com/v5/market/tickers?category=spot&symbol=TONUSDT', lambda j: j['result']['list'][0]['lastPrice']),
-    ('binance', 'https://api.binance.com/api/v3/ticker/price?symbol=TONUSDT', lambda j: j['price']),
+TON_SOURCES = [   # صرافی‌هایی که از IP گیت‌هاب بسته‌اند (okx/bybit/binance/gate/kucoin) حذف شدند
     ('coingecko', 'https://api.coingecko.com/api/v3/simple/price?ids=the-open-network&vs_currencies=usd', lambda j: j['the-open-network']['usd']),
+    ('coinbase', 'https://api.coinbase.com/v2/prices/TON-USD/spot', lambda j: j['data']['amount']),
+    ('mexc', 'https://api.mexc.com/api/v3/ticker/price?symbol=TONUSDT', lambda j: j['price']),
+    ('cryptocompare', 'https://min-api.cryptocompare.com/data/price?fsym=TON&tsyms=USD', lambda j: j['USD']),
 ]
 
 
@@ -278,33 +338,47 @@ async def push_rates(c):
 
 # ───────────────────────── حلقهٔ اصلی ─────────────────────────
 async def main():
+    if not (API_ID and API_HASH and SESSION and BOT):
+        log('❌ یکی از Secretها خالی است (TG_API_ID, TG_API_HASH, TG_SESSION, BOT_USERNAME)'); sys.exit(2)
+    try:
+        import telethon
+        from telethon.tl.alltlobjects import LAYER
+        log(f'telethon {telethon.__version__} layer {LAYER}')
+    except Exception: pass
     async with TelegramClient(StringSession(SESSION), API_ID, API_HASH) as c:
-        last = {'rates': 0.0, 'tokens': 0.0 if not FORCE_TOKENS else -1e9, 'cols': 0.0}
-        gifts, cat_at, cat_i, cycle = [], {}, 0, 0
+        try: me = await c.get_me(); log(f'وارد شد: id={me.id} (حساب {"bot!" if me.bot else "کاربر"})')
+        except (errors.AuthKeyUnregisteredError, errors.AuthKeyDuplicatedError, errors.SessionRevokedError) as e:
+            log('❌ سشن باطل شده؛ دوباره make_session.py بزن و TG_SESSION را عوض کن:', type(e).__name__); sys.exit(3)
+        last = {'rates': 0.0, 'tokens': 0.0, 'cols': 0.0}
+        gifts, cat_at, cycle = [], {}, 0
         due = lambda k, every: time.time() - last[k] >= every
         while left() > 20:
             cs = time.time(); cycle += 1
             try:
                 if due('rates', 300): await push_rates(c); last['rates'] = time.time()
                 if due('tokens', 1800): await refresh_tokens(c); last['tokens'] = time.time()
-                if due('cols', 1800) or not gifts:
-                    gifts = await all_gifts(c); await send_cols(c, gifts); last['cols'] = time.time()
+                if due('cols', 1800 if gifts else 300):
+                    gifts = await all_gifts(c); last['cols'] = time.time()
+                    if gifts: await send_cols(c, gifts)
+                    else: log('❌ هیچ کالکشنی پیدا نشد؛ خط‌های بالا (GetStarGifts →) را برای پشتیبانی بفرست')
+            except (errors.AuthKeyUnregisteredError, errors.AuthKeyDuplicatedError, errors.SessionRevokedError) as e:
+                log('❌ سشن باطل شد:', type(e).__name__); sys.exit(3)
             except Exception as e: log('setup FAIL:', repr(e)[:200])
-            # کالکشن‌های دارای آگهی هر چرخه؛ بقیه (فعلاً بی‌آگهی) هر سومین چرخه تا اولین آگهی‌شان هم دیر نماند
-            live = [g for g in gifts if (getattr(g, 'availability_resale', 0) or 0) > 0 or cycle % 3 == 0]
+            has_counts = any(hasattr(g, 'availability_resale') for g, _ in gifts)
+            live = [(g, n) for g, n in gifts if not has_counts or (getattr(g, 'availability_resale', 0) or 0) > 0 or cycle % 3 == 0]
             changed = 0
-            for g in live:
+            for g, name in live:
                 if left() < 20: break
-                try: changed += await poll_collection(c, g)
-                except Exception as e: log('poll FAIL', g.title, repr(e)[:160])
-            # کاتالوگ ویژگی‌ها: چند کالکشن در هر چرخه، هر کالکشن هر ~۶ ساعت
-            todo = [g for g in gifts if time.time() - cat_at.get(g.title, 0) > CAT_EVERY_S][:CAT_PER_CYCLE]
-            for g in todo:
+                try: changed += await poll_collection(c, g, name)
+                except Exception as e: log('poll FAIL', name, repr(e)[:160])
+            todo = [(g, n) for g, n in gifts if time.time() - cat_at.get(n, 0) > CAT_EVERY_S][:CAT_PER_CYCLE]
+            for g, name in todo:
                 if left() < 20: break
-                try: n = await send_catalog(c, g); cat_at[g.title] = time.time(); log(f'cat {g.title}: {n} ویژگی')
-                except Exception as e: log('cat FAIL', g.title, repr(e)[:160]); cat_at[g.title] = time.time() - CAT_EVERY_S + 900   # ۱۵ دقیقه بعد دوباره
+                try: k = await send_catalog(c, g, name); cat_at[name] = time.time(); log(f'cat {name}: {k} ویژگی')
+                except Exception as e: log('cat FAIL', name, repr(e)[:160]); cat_at[name] = time.time() - CAT_EVERY_S + 900
             log(f'چرخهٔ {cycle}: {len(live)} کالکشن، {changed} تغییر، {time.time() - cs:.0f}s')
             await asyncio.sleep(max(0, MIN_CYCLE_S - (time.time() - cs)))
 
 
-asyncio.run(main())
+if __name__ == '__main__':
+    asyncio.run(main())
